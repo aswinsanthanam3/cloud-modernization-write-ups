@@ -1,0 +1,564 @@
+# =============================================================================
+# Compliance Control Mapping — CIS AWS Foundations Benchmark v5.0.0
+# =============================================================================
+#
+# Reference:  ADR-2025-002 (Automated Security and Compliance Governance)
+# Version:    2.0.0
+# Date:       2026-03-15
+# Author:     Aswin (Platform Engineering)
+#
+# CHANGES FROM v1.0.0:
+#   - Added tier_applicability per control (production/development/sandbox/shared_services)
+#   - Added scorecard thresholds per tier
+#   - Added Security Hub central configuration policy mappings
+#   - Scoped to NEW ACCOUNTS ONLY (vended via AFT)
+#   - Controls not applicable to a tier are excluded from that tier's scorecard
+#
+# =============================================================================
+
+framework:
+  name: "CIS AWS Foundations Benchmark"
+  version: "5.0.0"
+  security_hub_standards_arn: "arn:aws:securityhub:::standards/cis-aws-foundations-benchmark/v/5.0.0"
+  audit_manager_framework: "CIS AWS Foundations Benchmark v5.0"
+  total_controls: 40
+
+# =============================================================================
+# Scoping Policy
+# =============================================================================
+scoping:
+  applies_to: "new_accounts_only"
+  enforcement_mechanism: "AFT account vending pipeline"
+  description: >
+    Controls, scorecard, and automated remediation apply ONLY to accounts
+    vended through the AFT pipeline. Existing (brownfield) accounts are
+    excluded from scoring and automated enforcement until explicitly
+    enrolled in a future migration phase.
+  aft_enforcement:
+    global_customizations:
+      - "Enable Security Hub with tier-specific central configuration policy"
+      - "Enable AWS Config with organization recorder"
+      - "Enable GuardDuty, Inspector, IAM Access Analyzer"
+      - "Deploy mandatory tag policy"
+      - "Enable EBS default encryption"
+      - "Enable S3 Block Public Access (account level)"
+      - "Delete default VPC"
+      - "Deploy scorecard reporting Lambda"
+    account_type_customizations:
+      production: "Apply production Security Hub configuration policy"
+      development: "Apply development Security Hub configuration policy"
+      sandbox: "Apply sandbox Security Hub configuration policy"
+      shared_services: "Apply shared_services Security Hub configuration policy"
+
+# =============================================================================
+# Scorecard Configuration
+# =============================================================================
+scorecard:
+  metrics:
+    - metric_id: "cis_compliance_pct"
+      name: "CIS Compliance Score"
+      source: "security_hub"
+      description: >
+        Percentage of PASSED controls out of total APPLICABLE controls
+        for the account's tier. Controls marked not applicable to the
+        tier are excluded from the denominator.
+      calculation: "(passed_controls / applicable_controls) * 100"
+
+    - metric_id: "tag_compliance_pct"
+      name: "Tag Compliance Score"
+      source: "config_rule"
+      config_rule: "required-tags"
+      description: >
+        Percentage of taggable resources that have all mandatory tags
+        present and conforming to enforced values.
+      calculation: "(compliant_resources / total_taggable_resources) * 100"
+      mandatory_tags:
+        - key: "Environment"
+          enforced_values: ["production", "development", "sandbox", "shared-services"]
+        - key: "CostCenter"
+          pattern: "^CC-\\d{6}$"
+        - key: "Owner"
+          pattern: "^[\\w.+-]+@[\\w-]+\\.[\\w.]+$"
+        - key: "DataClassification"
+          enforced_values: ["public", "internal", "confidential", "restricted"]
+
+  thresholds:
+    warning:
+      cis_compliance_pct: 90
+      tag_compliance_pct: 90
+      action: "notify_owner"
+      description: "Account owner receives Slack/email notification with finding details"
+    critical:
+      cis_compliance_pct: 80
+      tag_compliance_pct: 80
+      action: "notify_owner_and_escalate"
+      description: "Account owner notified AND platform team receives escalation alert"
+    escalation:
+      cis_compliance_pct: 70
+      tag_compliance_pct: 70
+      action: "notify_owner_escalate_and_flag"
+      description: >
+        Account owner notified, platform team escalated, account flagged
+        in governance dashboard for leadership review. Repeated breaches
+        may trigger manual quarantine SCP attachment.
+
+  notification:
+    channels:
+      - type: "sns"
+        topic_name: "account-scorecard-alerts"
+        subscribers: ["platform-team-email", "security-team-email"]
+      - type: "slack"
+        webhook_parameter: "/scorecard/slack-webhook-url"
+        channel: "#cloud-governance"
+    escalation_chain:
+      warning: ["account_owner"]
+      critical: ["account_owner", "platform_team"]
+      escalation: ["account_owner", "platform_team", "engineering_leadership"]
+
+  evaluation_schedule:
+    frequency: "every_6_hours"
+    eventbridge_rule: "scorecard-evaluation-schedule"
+    description: >
+      Lambda evaluates Security Hub compliance scores and Config tag
+      compliance every 6 hours. Threshold breaches trigger immediate
+      notification. Weekly summary report generated on Monday 08:00 UTC.
+    weekly_summary:
+      day: "monday"
+      time_utc: "08:00"
+      report_format: "html_email"
+      includes: ["all_account_scores", "trend_7d", "top_failing_controls"]
+
+# =============================================================================
+# Security Hub Central Configuration Policies (per tier)
+# =============================================================================
+security_hub_policies:
+  production:
+    policy_name: "cis-production-full"
+    description: "All 40 CIS v5.0 controls enabled — full Level 1 + Level 2"
+    enabled_controls: "all"
+    disabled_controls: []
+    applicable_control_count: 40
+
+  development:
+    policy_name: "cis-development-standard"
+    description: "Level 1 controls + select Level 2 (encryption, logging). Excludes HA and advanced monitoring."
+    enabled_controls: "level_1_plus_select_level_2"
+    disabled_controls:
+      - "RDS.5"    # Multi-AZ instances — not required in dev
+      - "RDS.15"   # Multi-AZ clusters — not required in dev
+      - "S3.20"    # MFA delete — operational overhead in dev
+      - "S3.22"    # S3 object-level write logging — cost prohibitive in dev
+      - "S3.23"    # S3 object-level read logging — cost prohibitive in dev
+      - "IAM.6"    # Hardware MFA for root — virtual MFA sufficient in dev
+    applicable_control_count: 34
+
+  sandbox:
+    policy_name: "cis-sandbox-minimal"
+    description: "Core security controls only — identity, encryption basics, network fundamentals."
+    enabled_controls: "core_security_subset"
+    disabled_controls:
+      - "RDS.5"    # Multi-AZ instances
+      - "RDS.15"   # Multi-AZ clusters
+      - "RDS.13"   # Auto minor version upgrade
+      - "S3.20"    # MFA delete
+      - "S3.22"    # S3 object-level write logging
+      - "S3.23"    # S3 object-level read logging
+      - "IAM.6"    # Hardware MFA for root
+      - "IAM.3"    # Access key rotation — sandbox accounts are ephemeral
+      - "IAM.22"   # Unused credentials — sandbox accounts are ephemeral
+      - "IAM.26"   # Expired SSL certs
+      - "EFS.1"    # EFS KMS encryption
+      - "EFS.8"    # EFS encryption at rest
+      - "EC2.2"    # Default SG closed — sandbox allows experimentation
+      - "CloudTrail.2"  # CloudTrail KMS encryption — org trail covers this
+      - "CloudTrail.4"  # Log file validation — org trail covers this
+      - "CloudTrail.7"  # CloudTrail S3 bucket logging — org trail covers this
+    applicable_control_count: 24
+
+  shared_services:
+    policy_name: "cis-shared-services-full"
+    description: "All 40 CIS v5.0 controls enabled — infrastructure accounts need full coverage."
+    enabled_controls: "all"
+    disabled_controls: []
+    applicable_control_count: 40
+
+# =============================================================================
+# Tier Applicability Matrix
+# =============================================================================
+# This matrix defines which controls apply to which tier.
+# Controls not applicable to a tier are:
+#   1. Disabled in that tier's Security Hub central configuration policy
+#   2. Excluded from that tier's scorecard denominator
+#   3. Not evaluated for remediation in that tier
+#
+# Legend:
+#   ✓  = Applicable (included in scorecard, remediation active)
+#   -  = Not applicable (excluded from scorecard, control disabled)
+# =============================================================================
+
+tier_applicability:
+  # ─── Section 1: Identity & Access Management ───────────────────────────
+  - security_hub_control_id: "Account.1"
+    cis_control_id: "1.1"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "IAM.4"
+    cis_control_id: "1.4"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "IAM.9"
+    cis_control_id: "1.5"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "IAM.6"
+    cis_control_id: "1.6"
+    production: true
+    development: false    # Virtual MFA sufficient
+    sandbox: false         # Virtual MFA sufficient
+    shared_services: true
+
+  - security_hub_control_id: "IAM.15"
+    cis_control_id: "1.7"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "IAM.16"
+    cis_control_id: "1.8"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "IAM.5"
+    cis_control_id: "1.10"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "IAM.2"
+    cis_control_id: "1.12"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "IAM.3"
+    cis_control_id: "1.13"
+    production: true
+    development: true
+    sandbox: false         # Sandbox accounts are ephemeral
+    shared_services: true
+
+  - security_hub_control_id: "IAM.22"
+    cis_control_id: "1.14"
+    production: true
+    development: true
+    sandbox: false         # Sandbox accounts are ephemeral
+    shared_services: true
+
+  - security_hub_control_id: "IAM.26"
+    cis_control_id: "1.15"
+    production: true
+    development: true
+    sandbox: false
+    shared_services: true
+
+  - security_hub_control_id: "IAM.27"
+    cis_control_id: "1.16"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "IAM.28"
+    cis_control_id: "1.17"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "IAM.18"
+    cis_control_id: "1.18"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  # ─── Section 2: Storage ─────────────────────────────────────────────────
+  - security_hub_control_id: "S3.1"
+    cis_control_id: "2.1.1"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "S3.5"
+    cis_control_id: "2.1.2"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "S3.8"
+    cis_control_id: "2.1.3"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "S3.20"
+    cis_control_id: "2.1.4"
+    production: true
+    development: false     # Operational overhead; requires root credentials
+    sandbox: false
+    shared_services: true
+
+  - security_hub_control_id: "S3.22"
+    cis_control_id: "2.1.5"
+    production: true
+    development: false     # Cost prohibitive in dev
+    sandbox: false
+    shared_services: true
+
+  - security_hub_control_id: "S3.23"
+    cis_control_id: "2.1.6"
+    production: true
+    development: false     # Cost prohibitive in dev
+    sandbox: false
+    shared_services: true
+
+  - security_hub_control_id: "EFS.1"
+    cis_control_id: "2.2.1"
+    production: true
+    development: true
+    sandbox: false
+    shared_services: true
+
+  - security_hub_control_id: "EFS.8"
+    cis_control_id: "2.2.2"
+    production: true
+    development: true
+    sandbox: false
+    shared_services: true
+
+  - security_hub_control_id: "RDS.3"
+    cis_control_id: "2.3.1"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "RDS.2"
+    cis_control_id: "2.3.2"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "RDS.5"
+    cis_control_id: "2.3.3"
+    production: true
+    development: false     # Single-AZ acceptable in dev
+    sandbox: false
+    shared_services: true
+
+  - security_hub_control_id: "RDS.13"
+    cis_control_id: "2.3.4"
+    production: true
+    development: true
+    sandbox: false
+    shared_services: true
+
+  - security_hub_control_id: "RDS.15"
+    cis_control_id: "2.3.5"
+    production: true
+    development: false     # Single-AZ acceptable in dev
+    sandbox: false
+    shared_services: true
+
+  - security_hub_control_id: "KMS.4"
+    cis_control_id: "2.4.1"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  # ─── Section 3: Logging ─────────────────────────────────────────────────
+  - security_hub_control_id: "CloudTrail.1"
+    cis_control_id: "3.1"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "CloudTrail.2"
+    cis_control_id: "3.2"
+    production: true
+    development: true
+    sandbox: false         # Org trail covers; no per-account trail needed
+    shared_services: true
+
+  - security_hub_control_id: "CloudTrail.4"
+    cis_control_id: "3.3"
+    production: true
+    development: true
+    sandbox: false         # Org trail covers
+    shared_services: true
+
+  - security_hub_control_id: "CloudTrail.7"
+    cis_control_id: "3.4"
+    production: true
+    development: true
+    sandbox: false         # Org trail covers
+    shared_services: true
+
+  - security_hub_control_id: "Config.1"
+    cis_control_id: "3.5"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  # ─── Section 5: Networking ──────────────────────────────────────────────
+  - security_hub_control_id: "EC2.7"
+    cis_control_id: "5.1.1"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "EC2.8"
+    cis_control_id: "5.1.2"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "EC2.2"
+    cis_control_id: "5.2"
+    production: true
+    development: true
+    sandbox: false         # Sandbox allows experimentation
+    shared_services: true
+
+  - security_hub_control_id: "EC2.6"
+    cis_control_id: "5.3"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "EC2.53"
+    cis_control_id: "5.4"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "EC2.54"
+    cis_control_id: "5.5"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+  - security_hub_control_id: "EC2.21"
+    cis_control_id: "5.6"
+    production: true
+    development: true
+    sandbox: true
+    shared_services: true
+
+# =============================================================================
+# Summary — Controls Applicable Per Tier
+# =============================================================================
+summary:
+  total_controls: 40
+
+  per_tier:
+    production:
+      applicable_controls: 40
+      scorecard_denominator: 40
+      cis_target: "≥95%"
+      tag_target: "≥95%"
+
+    development:
+      applicable_controls: 34
+      scorecard_denominator: 34
+      disabled_controls:
+        - "IAM.6"      # Hardware MFA (Level 2)
+        - "S3.20"      # MFA delete (Level 2)
+        - "S3.22"      # S3 write logging (Level 2)
+        - "S3.23"      # S3 read logging (Level 2)
+        - "RDS.5"      # Multi-AZ instances (Level 2)
+        - "RDS.15"     # Multi-AZ clusters (Level 2)
+      cis_target: "≥90%"
+      tag_target: "≥90%"
+
+    sandbox:
+      applicable_controls: 24
+      scorecard_denominator: 24
+      disabled_controls:
+        - "IAM.6"      # Hardware MFA
+        - "IAM.3"      # Access key rotation
+        - "IAM.22"     # Unused credentials
+        - "IAM.26"     # Expired SSL certs
+        - "S3.20"      # MFA delete
+        - "S3.22"      # S3 write logging
+        - "S3.23"      # S3 read logging
+        - "EFS.1"      # EFS KMS encryption
+        - "EFS.8"      # EFS encryption at rest
+        - "RDS.5"      # Multi-AZ instances
+        - "RDS.13"     # RDS auto minor upgrades
+        - "RDS.15"     # Multi-AZ clusters
+        - "EC2.2"      # Default SG closed
+        - "CloudTrail.2"  # CloudTrail encryption
+        - "CloudTrail.4"  # Log file validation
+        - "CloudTrail.7"  # CT S3 bucket logging
+      cis_target: "≥85%"
+      tag_target: "≥85%"
+
+    shared_services:
+      applicable_controls: 40
+      scorecard_denominator: 40
+      cis_target: "≥95%"
+      tag_target: "≥95%"
+
+  # Quick reference: auto-remediation by tier (Production)
+  auto_remediate_production:
+    - "S3.1"
+    - "S3.5"
+    - "S3.8"
+    - "RDS.2"
+    - "CloudTrail.1"
+    - "CloudTrail.2"
+    - "CloudTrail.4"
+    - "CloudTrail.7"
+    - "EC2.2"
+    - "EC2.6"
+    - "EC2.7"
+    - "EC2.53"
+    - "EC2.54"
+    - "KMS.4"
+
+  approval_gate_production:
+    - "IAM.3"
+    - "IAM.22"
+    - "IAM.26"
+    - "RDS.3"
+    - "RDS.5"
+    - "RDS.13"
+    - "EC2.8"
+    - "EC2.21"
